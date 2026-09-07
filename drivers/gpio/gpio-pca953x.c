@@ -1217,9 +1217,9 @@ static void pca953x_remove(struct i2c_client *client)
 }
 
 #ifdef CONFIG_PM_SLEEP
-static int pca953x_regcache_sync(struct device *dev)
+static int pca953x_regcache_sync(struct pca953x_chip *chip)
 {
-	struct pca953x_chip *chip = dev_get_drvdata(dev);
+	struct device *dev = &chip->client->dev;
 	int ret;
 	u8 regaddr;
 
@@ -1266,6 +1266,44 @@ static int pca953x_regcache_sync(struct device *dev)
 	return 0;
 }
 
+static int pca953x_restore_context(struct pca953x_chip *chip)
+{
+	int ret;
+
+	guard(mutex)(&chip->i2c_lock);
+
+	if (chip->client->irq > 0)
+		enable_irq(chip->client->irq);
+	regcache_cache_only(chip->regmap, false);
+	regcache_mark_dirty(chip->regmap);
+	ret = pca953x_regcache_sync(chip);
+	if (ret)
+		goto err;
+
+	ret = regcache_sync(chip->regmap);
+	if (ret)
+		goto err;
+
+	return 0;
+
+err:
+	if (chip->client->irq > 0)
+		disable_irq(chip->client->irq);
+	regcache_cache_only(chip->regmap, true);
+
+	return ret;
+}
+
+static void pca953x_save_context(struct pca953x_chip *chip)
+{
+	guard(mutex)(&chip->i2c_lock);
+
+	/* Disable IRQ to prevent early triggering while regmap "cache only" is on */
+	if (chip->client->irq > 0)
+		disable_irq(chip->client->irq);
+	regcache_cache_only(chip->regmap, true);
+}
+
 static int pca953x_suspend(struct device *dev)
 {
 	struct pca953x_chip *chip = dev_get_drvdata(dev);
@@ -1279,9 +1317,7 @@ static int pca953x_suspend(struct device *dev)
 	 * cache if there is no regulator.
 	 */
 	if (chip->regulator) {
-		mutex_lock(&chip->i2c_lock);
-		regcache_cache_only(chip->regmap, true);
-		mutex_unlock(&chip->i2c_lock);
+		pca953x_save_context(chip);
 	}
 
 	if (atomic_read(&chip->wakeup_path))
@@ -1306,17 +1342,7 @@ static int pca953x_resume(struct device *dev)
 	}
 
 	if (chip->regulator) {
-		mutex_lock(&chip->i2c_lock);
-		regcache_cache_only(chip->regmap, false);
-		regcache_mark_dirty(chip->regmap);
-		ret = pca953x_regcache_sync(dev);
-		if (ret) {
-			mutex_unlock(&chip->i2c_lock);
-			return ret;
-		}
-
-		ret = regcache_sync(chip->regmap);
-		mutex_unlock(&chip->i2c_lock);
+		ret = pca953x_restore_context(chip);
 		if (ret) {
 			dev_err(dev, "Failed to restore register map: %d\n", ret);
 			return ret;
